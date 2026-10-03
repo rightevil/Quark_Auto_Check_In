@@ -1,3 +1,20 @@
+# ============================================================================
+# 夸克网盘每日签到（含结果推送）
+#
+# 用法：
+#   1. 把这个文件内容整体覆盖到你 Fork 仓库的 .github/workflows/quark_signin.yml
+#   2. 在 Settings -> Secrets and variables -> Actions 里按需加下面的 Secret（加一个即可）：
+#        PUSHPLUS_TOKEN      PushPlus 微信推送  https://www.pushplus.plus/  （扫码登录拿 token，最简单）
+#        SERVERCHAN_KEY      Server酱 微信推送  https://sct.ftqq.com/      （扫码登录拿 SendKey）
+#        BARK_URL            Bark 推送到 iPhone https://bark.day.app/     （填 https://api.day.app/你的key）
+#        WECOM_WEBHOOK       企业微信群机器人 Webhook 完整 URL
+#      哪个配了就推哪个，可以同时配多个。
+#   3. 什么都不配也能用：结果会自动写进 Actions 运行页面的 Summary（不用 secret 就能看）
+#
+# 与原版的差异（只在末尾新增了一个"推送签到结果"步骤，并在执行脚本时把输出存成 signin.log）：
+#   - 执行签到脚本：加了 `tee signin.log`，把脚本输出留存下来
+#   - 推送签到结果：新增步骤，if: always()，无论成功/失败/跳过都会推
+# ============================================================================
 name: 夸克网盘每日签到
 
 on:
@@ -62,11 +79,15 @@ jobs:
         if: steps.cache-success.outputs.cache-hit != 'true'
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
+      # 与原版唯一改动1：tee signin.log，把脚本输出留档给后面的推送步骤用
       - name: 执行签到脚本
+        id: checkin
         if: steps.cache-success.outputs.cache-hit != 'true'
         env:
           COOKIE_QUARK: ${{ secrets.COOKIE_QUARK }}
-        run: python checkIn_Quark.py
+        run: |
+          set -o pipefail
+          python checkIn_Quark.py 2>&1 | tee signin.log
 
       - name: 生成今日成功标记
         if: success() && steps.cache-success.outputs.cache-hit != 'true'
@@ -80,3 +101,95 @@ jobs:
         with:
           path: .cache/quark-signin
           key: quark-signed-${{ steps.date.outputs.today }}
+
+      # 与原版唯一改动2：新增推送步骤。always() = 成功/失败/跳过都会执行
+      - name: 推送签到结果
+        if: always()
+        shell: bash
+        env:
+          CHECK_OUTCOME: ${{ steps.checkin.outcome }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u
+
+          # 1) 标题：分成功 / 失败 / 今日已跳过 三种
+          case "$CHECK_OUTCOME" in
+            success) TITLE="✅ 夸克签到成功" ;;
+            failure) TITLE="❌ 夸克签到失败" ;;
+            skipped) TITLE="⏭ 夸克签到：今日已完成（跳过）" ;;
+            *)       TITLE="夸克签到结果" ;;
+          esac
+
+          # 2) 正文：脚本日志；没日志（缓存命中跳过）就给固定文案
+          if [ -f signin.log ]; then
+            LOG="$(cat signin.log)"
+          else
+            LOG="今日已全部签到成功，跳过重复执行。"
+          fi
+          BODY="${TITLE}
+
+          ${LOG}
+
+          ${REPO}
+          ${RUN_URL}"
+
+          echo "===== 本次推送内容 ====="
+          printf '%s\n' "$BODY"
+          echo "========================"
+
+          # 3) 无论如何都写进 Actions 运行页面的 Summary（零配置可见）
+          {
+            printf '## %s\n\n```\n%s\n```\n\n[查看本次运行](%s)\n' "$TITLE" "$LOG" "$RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 4) 按配置的 Secret 逐渠道推送
+          sent=0
+
+          if [ -n "${PUSHPLUS_TOKEN:-}" ]; then
+            echo "→ 推送 PushPlus"
+            curl -sS -m 20 -X POST "https://www.pushplus.plus/send" \
+              -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg t "$TITLE" --arg c "$BODY" --arg k "$PUSHPLUS_TOKEN" \
+                    '{token:$k,title:$t,content:$c,template:"txt"}')" || echo "（PushPlus 推送失败，不影响签到）"
+            echo
+            sent=1
+          fi
+
+          if [ -n "${SERVERCHAN_KEY:-}" ]; then
+            echo "→ 推送 Server酱"
+            curl -sS -m 20 -X POST "https://sctapi.ftqq.com/${SERVERCHAN_KEY}.send" \
+              --data-urlencode "title=${TITLE}" \
+              --data-urlencode "desp=${LOG}" || echo "（Server酱推送失败，不影响签到）"
+            echo
+            sent=1
+          fi
+
+          if [ -n "${BARK_URL:-}" ]; then
+            WECOM_PAYLOAD="$(jq -n --arg t "$TITLE" --arg b "$LOG" '{title:$t,body:$b}')"
+            echo "→ 推送 Bark"
+            curl -sS -m 20 -X POST "${BARK_URL%/}?autoCopy=0&group=Quark" \
+              -H 'Content-Type: application/json' \
+              -d "$WECOM_PAYLOAD" || echo "（Bark 推送失败，不影响签到）"
+            echo
+            sent=1
+          fi
+
+          if [ -n "${WECOM_WEBHOOK:-}" ]; then
+            MSG="${TITLE}
+          ${LOG}"
+            echo "→ 推送企业微信机器人"
+            curl -sS -m 20 -X POST "$WECOM_WEBHOOK" \
+              -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg c "$MSG" '{msgtype:"text",text:{content:$c}}')" || echo "（企业微信推送失败，不影响签到）"
+            echo
+            sent=1
+          fi
+
+          if [ "$sent" = "0" ]; then
+            echo "ℹ️ 未配置任何推送 Secret（PUSHPLUS_TOKEN / SERVERCHAN_KEY / BARK_URL / WECOM_WEBHOOK），本次结果只写入 Actions 页面 Summary。"
+          fi
