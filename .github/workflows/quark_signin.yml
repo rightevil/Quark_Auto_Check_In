@@ -11,16 +11,25 @@
 #      哪个配了就推哪个，可以同时配多个。
 #   3. 什么都不配也能用：结果会自动写进 Actions 运行页面的 Summary（不用 secret 就能看）
 #
-# 与原版的差异（只在末尾新增了一个"推送签到结果"步骤，并在执行脚本时把输出存成 signin.log）：
+# 定时说明：
+#   - 使用 Asia/Shanghai 时区，即北京时间（UTC+8，无夏令时）
+#   - 主任务：每天北京时间 09:17
+#   - 兜底任务：每天北京时间 13:43
+#   - 特意避开每小时整点，以降低 GitHub Actions schedule 高峰延迟的概率
+#   - 如果当天主任务已经签到成功，兜底任务命中成功缓存后会静默跳过，不再重复推送
+#
+# 与原版的差异：
 #   - 执行签到脚本：加了 `tee signin.log`，把脚本输出留存下来
-#   - 推送签到结果：新增步骤，if: always()，无论成功/失败/跳过都会推
+#   - 推送签到结果：签到实际执行后无论成功/失败都会推；命中当天成功缓存时静默跳过
 # ============================================================================
 name: 夸克网盘每日签到
 
 on:
   schedule:
-    - cron: "0 1 * * *" # 北京时间 09:00
-    - cron: "0 5 * * *" # 北京时间 13:00，失败兜底
+    - cron: "17 9 * * *"
+      timezone: "Asia/Shanghai" # 北京时间 09:17，主签到
+    - cron: "43 13 * * *"
+      timezone: "Asia/Shanghai" # 北京时间 13:43，失败兜底
   workflow_dispatch:
 
 permissions:
@@ -102,9 +111,9 @@ jobs:
           path: .cache/quark-signin
           key: quark-signed-${{ steps.date.outputs.today }}
 
-      # 与原版唯一改动2：新增推送步骤。always() = 成功/失败/跳过都会执行
+      # 签到实际执行后推送结果；如果当天已成功并命中缓存，则静默跳过，避免重复通知
       - name: 推送签到结果
-        if: always()
+        if: always() && steps.cache-success.outputs.cache-hit != 'true'
         shell: bash
         env:
           CHECK_OUTCOME: ${{ steps.checkin.outcome }}
@@ -125,11 +134,11 @@ jobs:
             *)       TITLE="夸克签到结果" ;;
           esac
 
-          # 2) 正文：脚本日志；没日志（缓存命中跳过）就给固定文案
+          # 2) 正文：优先使用签到脚本日志
           if [ -f signin.log ]; then
             LOG="$(cat signin.log)"
           else
-            LOG="今日已全部签到成功，跳过重复执行。"
+            LOG="未生成签到日志，请打开 Actions 运行页面查看详细执行结果。"
           fi
           BODY="${TITLE}
 
